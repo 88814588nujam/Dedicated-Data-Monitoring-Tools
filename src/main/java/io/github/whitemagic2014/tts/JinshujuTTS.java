@@ -9,6 +9,8 @@ import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.text.SimpleDateFormat;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.List;
 import javax.imageio.ImageIO;
@@ -28,10 +30,10 @@ import com.microsoft.playwright.options.WaitUntilState;
 import io.github.whitemagic2014.tts.bean.Voice;
 
 public class JinshujuTTS {
-    public static int TIMEOUT = 12 * 1000;
+    public static int TIMEOUT = 8 * 1000;
     public static int LOADINGFREQ = 60 * 1000;
 
-    public static String watchUrl = "https://jinshuju.net/forms/NjaRQx/entries";
+    public static String watchUrl = "https://jinshuju.net/forms/NjaRQx/entries?filter=%7B\"scopeConditions\"%3A%5B%7B\"trigger\"%3A\"field_6\"%2C\"operator\"%3A\"Between\"%2C\"value\"%3A\"today\"%2C\"groupIndex\"%3A1%7D%5D%7D";
     private static String myUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0";
     private static final String CONFIG_FILE = "config/config.properties";
 
@@ -65,7 +67,8 @@ public class JinshujuTTS {
         ConfigManager.init();
         AppState.load();
         startMonitoring();
-        // & "D:\apache-maven\apache-maven-3.9.14\bin\mvn.cmd" clean package "-Dmaven.javadoc.skip=true" "-Dgpg.skip" "-DskipTests"
+        // & "D:\apache-maven\apache-maven-3.9.14\bin\mvn.cmd" clean package
+        // "-Dmaven.javadoc.skip=true" "-Dgpg.skip" "-DskipTests"
     }
 
     // ================= 初始化系统托盘 =================
@@ -110,7 +113,7 @@ public class JinshujuTTS {
         try (Playwright playwright = Playwright.create()) {
             Browser browser = playwright.chromium().launch(new BrowserType.LaunchOptions().setHeadless(true));
             BrowserContext context = browser.newContext(new Browser.NewContextOptions()
-                    .setViewportSize(4000, 4000)
+                    .setViewportSize(4000, 2000)
                     .setUserAgent(ConfigManager.get("userAgent", myUserAgent)));
             injectCookiesToContext(context, ConfigManager.get("cookie", ""));
 
@@ -150,44 +153,92 @@ public class JinshujuTTS {
                     if (isFirstRun)
                         ControlWidget.showWidget();
 
-                    Document doc = Jsoup.parse(page.content());
-                    Element container = doc.selectFirst("div.ag-center-cols-container");
-
+                    // ==========================================
+                    // 【核心修改】：边滚边抓，破解 ag-Grid 的 DOM 虚拟化
+                    // ==========================================
                     Map<String, Map<String, String>> currentOrders = new LinkedHashMap<>();
-                    if (container != null) {
-                        Elements rows = container.select("div[role='row']");
-                        for (int i = rows.size() - 1; i >= 0; i--) {
-                            Element row = rows.get(i);
-                            Map<String, String> rowData = new HashMap<>();
-                            Elements cells = row.select("div[role='gridcell']");
-                            for (Element cell : cells) {
-                                String colId = cell.attr("col-id");
-                                String value = cleanEmoji(cell.text().trim());
-                                if (colId != null && !colId.isEmpty())
-                                    rowData.put(colId, value);
+                    Document finalDoc = null;
+                    int expectedCount = -1;
+
+                    int maxScrollTimes = 50; // 足够大的滚动次数
+                    int stuckCounter = 0;
+
+                    for (int scrollAttempt = 1; scrollAttempt <= maxScrollTimes; scrollAttempt++) {
+                        // 1. 解析当前可见的 DOM 树
+                        Document doc = Jsoup.parse(page.content());
+                        finalDoc = doc;
+                        Element container = doc.selectFirst("div.ag-center-cols-container");
+
+                        // 2. 提取当前屏幕可见的数据并累加到 currentOrders
+                        if (container != null) {
+                            Elements rows = container.select("div[role='row']");
+                            for (int i = rows.size() - 1; i >= 0; i--) {
+                                Element row = rows.get(i);
+                                Map<String, String> rowData = new HashMap<>();
+                                Elements cells = row.select("div[role='gridcell']");
+                                for (Element cell : cells) {
+                                    String colId = cell.attr("col-id");
+                                    String value = cleanEmoji(cell.text().trim());
+                                    if (colId != null && !colId.isEmpty())
+                                        rowData.put(colId, value);
+                                }
+                                String orderId = rowData.get("field_4");
+                                if (orderId != null && !orderId.isEmpty())
+                                    currentOrders.put(orderId, rowData);
                             }
-                            String orderId = rowData.get("field_4");
-                            if (orderId != null && !orderId.isEmpty())
-                                currentOrders.put(orderId, rowData);
+                        }
+
+                        // 3. 提取 expectedCount (仅做记录，不再用于中断循环)
+                        Element loadedSpan = doc.selectFirst("div.ag-status-bar-left span:contains(已加载)");
+                        if (loadedSpan != null) {
+                            String loadedText = loadedSpan.text();
+                            String numStr = loadedText.replaceAll("[^0-9]", "");
+                            if (!numStr.isEmpty()) {
+                                expectedCount = Integer.parseInt(numStr);
+                            }
+                        }
+
+                        // 4. 执行 JS 页面向下滚动
+                        Boolean isScrolled = (Boolean) page.evaluate(
+                                "() => {" +
+                                        "   var viewport = document.querySelector('.ag-body-viewport');" +
+                                        "   if(viewport) {" +
+                                        "       var oldScrollTop = viewport.scrollTop;" +
+                                        "       viewport.scrollTop += 500;" + // 小步长滚动
+                                        "       return viewport.scrollTop > oldScrollTop;" + // 判断是否还能继续往下滚
+                                        "   } else {" +
+                                        "       return false;" +
+                                        "   }" +
+                                        "}");
+
+                        // 5. 靠物理滚动到底部来判断是否结束
+                        if (isScrolled != null && isScrolled) {
+                            page.waitForTimeout(500); // 成功滚动，等待新数据渲染
+                            stuckCounter = 0; // 只要能滚，计数器就清零
+                        } else {
+                            page.waitForTimeout(500);
+                            stuckCounter++;
+                            // 【核心结束条件】：连续 3 次 滚不动，说明真的到底了，或者网络请求彻底结束了
+                            if (stuckCounter >= 3) {
+                                break;
+                            }
                         }
                     }
 
-                    Element loadedSpan = doc.selectFirst("div.ag-status-bar-left span:contains(已加载)");
-
-                    if (loadedSpan != null) {
-                        String loadedText = loadedSpan.text();
-                        String numStr = loadedText.replaceAll("[^0-9]", "");
-                        if (!numStr.isEmpty()) {
-                            int expectedCount = Integer.parseInt(numStr);
-                            if (expectedCount >= 0 && currentOrders.size() == expectedCount) {
-                                isDataValid = true;
-                                latestOrders = currentOrders;
-                                ControlWidget.updateDataCount(currentOrders.size());
-                            }
-                        }
+                    // ==========================================
+                    // 滚动彻底结束后，再进行最终的数据校验
+                    // ==========================================
+                    int diff = Math.abs(currentOrders.size() - expectedCount);
+                    if (expectedCount >= 0 && currentOrders.size() >= expectedCount && diff <= 150) {
+                        isDataValid = true;
+                        latestOrders = currentOrders; // 更新全局变量
+                        ControlWidget.updateDataCount(currentOrders.size());
                     }
 
-                    saveHtmlToFile(doc);
+                    if (finalDoc != null) {
+                        saveHtmlToFile(finalDoc);
+                    }
+                    // ... 后续的新单提醒逻辑保持不变 ...
 
                     if (isDataValid) {
                         if (isFirstRun) {
@@ -204,40 +255,45 @@ public class JinshujuTTS {
                                     String orderId = entry.getKey();
                                     if (!previousOrders.containsKey(orderId)) {
                                         Map<String, String> data = entry.getValue();
-                                        String channel = data.getOrDefault("field_20", "吕勇志--357观光专用");
-                                        boolean usefulOrder = isExist(AppState.channels, channel);
-                                        if(usefulOrder){
-                                            String orderType = formatOrderType(data.getOrDefault("field_19", "点对点"));
-                                            String time = data.getOrDefault("field_7", "未知时间");
-                                            String from = data.getOrDefault("field_36", "未知起点");
-                                            String to = data.getOrDefault("field_37", "未知终点");
-                                            String req = data.getOrDefault("field_27", "无");
+                                        String daily = data.getOrDefault("field_6", "1999-12-31");
+                                        if (daily.equals(getDaily())) {
+                                            String channel = data.getOrDefault("field_20", "吕勇志--357观光专用");
+                                            boolean usefulOrder = isExist(AppState.channels, channel);
+                                            if (usefulOrder) {
+                                                String orderType = formatOrderType(
+                                                        data.getOrDefault("field_19", "点对点"));
+                                                String time = data.getOrDefault("field_7", "未知时间");
+                                                String from = data.getOrDefault("field_36", "未知起点");
+                                                String to = data.getOrDefault("field_37", "未知终点");
+                                                String req = data.getOrDefault("field_27", "无");
 
-                                            String msg = "";
-                                            if (AppState.verbosity == 0)
-                                                msg = "<html>您有新的<font color='#FF6B6B'><b>" + orderType
-                                                        + "</b></font>订单！<font color='#FF6B6B'><b>" + time + "</b></font>，从"
-                                                        + from + "出发去往" + to + "，要求：<font color='#FF6B6B'><b>"
-                                                        + req + "</b></font>。订单号：" + orderId + "</html>";
-                                            else if (AppState.verbosity == 1) {
-                                                if (orderType.equals("送机"))
-                                                    msg = "<html>新的<font color='#FF6B6B'><b>" + orderType
+                                                String msg = "";
+                                                if (AppState.verbosity == 0)
+                                                    msg = "<html>您有新的<font color='#FF6B6B'><b>" + orderType
                                                             + "</b></font>订单！<font color='#FF6B6B'><b>" + time
-                                                            + "</b></font>，去往" + to + "。</html>";
-                                                else if (orderType.equals("接机"))
-                                                    msg = "<html>新的<font color='#FF6B6B'><b>" + orderType
-                                                            + "</b></font>订单！<font color='#FF6B6B'><b>" + time
-                                                            + "</b></font>，从" + from + "接机。</html>";
-                                                else
+                                                            + "</b></font>，从"
+                                                            + from + "出发去往" + to + "，要求：<font color='#FF6B6B'><b>"
+                                                            + req + "</b></font>。订单号：" + orderId + "</html>";
+                                                else if (AppState.verbosity == 1) {
+                                                    if (orderType.equals("送机"))
+                                                        msg = "<html>新的<font color='#FF6B6B'><b>" + orderType
+                                                                + "</b></font>订单！<font color='#FF6B6B'><b>" + time
+                                                                + "</b></font>，去往" + to + "。</html>";
+                                                    else if (orderType.equals("接机"))
+                                                        msg = "<html>新的<font color='#FF6B6B'><b>" + orderType
+                                                                + "</b></font>订单！<font color='#FF6B6B'><b>" + time
+                                                                + "</b></font>，从" + from + "接机。</html>";
+                                                    else
+                                                        msg = "<html>新的<font color='#FF6B6B'><b>" + orderType
+                                                                + "</b></font>订单！<font color='#FF6B6B'><b>" + time
+                                                                + "</b></font>。</html>";
+                                                } else
                                                     msg = "<html>新的<font color='#FF6B6B'><b>" + orderType
                                                             + "</b></font>订单！<font color='#FF6B6B'><b>" + time
                                                             + "</b></font>。</html>";
-                                            } else
-                                                msg = "<html>新的<font color='#FF6B6B'><b>" + orderType
-                                                        + "</b></font>订单！<font color='#FF6B6B'><b>" + time
-                                                        + "</b></font>。</html>";
 
-                                            triggerNotification(msg);
+                                                triggerNotification(msg);
+                                            }
                                         }
                                     }
                                 }
@@ -249,28 +305,32 @@ public class JinshujuTTS {
                                     Map<String, String> currData = entry.getValue();
                                     Map<String, String> prevData = previousOrders.get(orderId);
                                     if (prevData != null) {
-                                        String prevDriver = prevData.get("field_43");
-                                        String currDriver = currData.get("field_43");
-                                        if ((prevDriver != null && !prevDriver.isEmpty())
-                                                && (currDriver == null || currDriver.isEmpty())) {
-                                            String channel = prevData.getOrDefault("field_20", "吕勇志--357观光专用");
-                                            boolean usefulOrder = isExist(AppState.channels, channel);
-                                            if(usefulOrder){
-                                                String orderType = formatOrderType(
-                                                        prevData.getOrDefault("field_19", "点对点"));
-                                                String msg = "";
-                                                if (AppState.verbosity == 0)
-                                                    msg = "<html>请确认已安排司机的<font color='#FF6B6B'><b>" + orderType
-                                                            + "</b></font>订单被取消！原定司机：<font color='#FF6B6B'><b>" + prevDriver
-                                                            + "</b></font>。订单号："
-                                                            + orderId + "</html>";
-                                                else if (AppState.verbosity == 1)
-                                                    msg = "<html>订单取消：原司机<font color='#FF6B6B'><b>" + prevDriver
-                                                            + "</b></font>，单号" + orderId + "</html>";
-                                                else
-                                                    msg = "司机取消" + orderId;
+                                        String daily = currData.getOrDefault("field_6", "1999-12-31");
+                                        if (daily.equals(getDaily())) {
+                                            String prevDriver = prevData.get("field_43");
+                                            String currDriver = currData.get("field_43");
+                                            if ((prevDriver != null && !prevDriver.isEmpty())
+                                                    && (currDriver == null || currDriver.isEmpty())) {
+                                                String channel = prevData.getOrDefault("field_20", "吕勇志--357观光专用");
+                                                boolean usefulOrder = isExist(AppState.channels, channel);
+                                                if (usefulOrder) {
+                                                    String orderType = formatOrderType(
+                                                            prevData.getOrDefault("field_19", "点对点"));
+                                                    String msg = "";
+                                                    if (AppState.verbosity == 0)
+                                                        msg = "<html>请确认已安排司机的<font color='#FF6B6B'><b>" + orderType
+                                                                + "</b></font>订单被取消！原定司机：<font color='#FF6B6B'><b>"
+                                                                + prevDriver
+                                                                + "</b></font>。订单号："
+                                                                + orderId + "</html>";
+                                                    else if (AppState.verbosity == 1)
+                                                        msg = "<html>订单取消：原司机<font color='#FF6B6B'><b>" + prevDriver
+                                                                + "</b></font>，单号" + orderId + "</html>";
+                                                    else
+                                                        msg = "司机取消" + orderId;
 
-                                                triggerNotification(msg);
+                                                    triggerNotification(msg);
+                                                }
                                             }
                                         }
                                     }
@@ -281,28 +341,31 @@ public class JinshujuTTS {
                                 for (String oldOrderId : previousOrders.keySet()) {
                                     if (!currentOrders.containsKey(oldOrderId)) {
                                         Map<String, String> oldData = previousOrders.get(oldOrderId);
-                                        String channel = oldData.getOrDefault("field_20", "吕勇志--357观光专用");
-                                        boolean usefulOrder = isExist(AppState.channels, channel);
-                                        if(usefulOrder){
-                                            String orderType = formatOrderType(oldData.getOrDefault("field_19", "点对点"));
-                                            String time = oldData.getOrDefault("field_7", "未知时间");
-                                            String from = oldData.getOrDefault("field_36", "未知起点");
-                                            String to = oldData.getOrDefault("field_37", "未知终点");
+                                        String daily = oldData.getOrDefault("field_6", "1999-12-31");
+                                        if (daily.equals(getDaily())) {
+                                            String channel = oldData.getOrDefault("field_20", "吕勇志--357观光专用");
+                                            boolean usefulOrder = isExist(AppState.channels, channel);
+                                            if (usefulOrder) {
+                                                String orderType = formatOrderType(oldData.getOrDefault("field_19", "点对点"));
+                                                String time = oldData.getOrDefault("field_7", "未知时间");
+                                                String from = oldData.getOrDefault("field_36", "未知起点");
+                                                String to = oldData.getOrDefault("field_37", "未知终点");
 
-                                            String msg = "";
-                                            if (AppState.verbosity == 0)
-                                                msg = "<html>请注意有订单已被平台侧移除！<font color='#FF6B6B'><b>" + time
-                                                        + "的<font color='#FF6B6B'><b>" + orderType + "</b></font>订单，从"
-                                                        + from + "到" + to
-                                                        + "。订单号：" + oldOrderId + "</html>";
-                                            else if (AppState.verbosity == 1)
-                                                msg = "<html><font color='#FF6B6B'><b>" + time
-                                                        + "</b></font>的<font color='#FF6B6B'><b>" + orderType
-                                                        + "</b></font>订单已被平台侧移除。</html>";
-                                            else
-                                                msg = "平台侧移除订单：" + oldOrderId;
+                                                String msg = "";
+                                                if (AppState.verbosity == 0)
+                                                    msg = "<html>请注意有订单已被平台侧移除！<font color='#FF6B6B'><b>" + time
+                                                            + "的<font color='#FF6B6B'><b>" + orderType + "</b></font>订单，从"
+                                                            + from + "到" + to
+                                                            + "。订单号：" + oldOrderId + "</html>";
+                                                else if (AppState.verbosity == 1)
+                                                    msg = "<html><font color='#FF6B6B'><b>" + time
+                                                            + "</b></font>的<font color='#FF6B6B'><b>" + orderType
+                                                            + "</b></font>订单已被平台侧移除。</html>";
+                                                else
+                                                    msg = "平台侧移除订单：" + oldOrderId;
 
-                                            triggerNotification(msg);
+                                                triggerNotification(msg);
+                                            }
                                         }
                                     }
                                 }
@@ -408,6 +471,13 @@ public class JinshujuTTS {
                 "");
     }
 
+    private static String getDaily() {
+        LocalDate now = LocalDate.now();
+        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd");
+        String todayStr = now.format(formatter);
+        return todayStr;
+    }
+
     private static void speek(String voiceString) {
         // 自动过滤掉 HTML 标签，防止语音把代码读出来
         voiceString = voiceString.replaceAll("<[^>]*>", "");
@@ -428,7 +498,7 @@ public class JinshujuTTS {
             String script = String.format(
                     "Add-Type -AssemblyName presentationCore; $m = New-Object System.Windows.Media.MediaPlayer; $m.Open('%s'); while($m.DownloadProgress -lt 1) { Start-Sleep -Milliseconds 100 }; $m.Play(); Start-Sleep -Milliseconds 500; while($m.Position -lt $m.NaturalDuration.TimeSpan -and $m.HasAudio) { Start-Sleep -Milliseconds 200 }",
                     file.getAbsolutePath().replace("\\", "/"));
-                    System.out.println(voiceString);
+            // System.out.println(voiceString);
             new ProcessBuilder("powershell", "-ExecutionPolicy", "Bypass", "-c", script).start().waitFor();
         } catch (Exception ignored) {
         } finally {
@@ -679,8 +749,10 @@ public class JinshujuTTS {
                 String type = row.get("field_19");
                 boolean noDriver = (driver == null || driver.trim().isEmpty());
                 boolean isTransfer = (type != null && (type.contains("接机") || type.contains("送机")));
-                if (noDriver && isTransfer)
-                    targetList.add(row);
+                if (noDriver && isTransfer) {
+                    // 使用 new HashMap 包装一层，防止修改原数据，并方便后续存入预处理字段
+                    targetList.add(new HashMap<>(row));
+                }
             }
 
             if (targetList.isEmpty()) {
@@ -689,22 +761,30 @@ public class JinshujuTTS {
             }
             targetList.sort(Comparator.comparing(r -> r.getOrDefault("field_7", "")));
 
-            StringBuilder sb = new StringBuilder();
-            sb.append("=== 金数据平台暂未分配司机的接送机订单 ===\r\n");
+            // ==========================================
+            // 预处理：提前解析地址和排版，防止重复调用导致卡顿
+            // ==========================================
             for (Map<String, String> row : targetList) {
                 String time = row.getOrDefault("field_7", "未知时间");
+
+                // 预解析起点
                 String from = row.getOrDefault("field_36", "未知起点");
-                if (from.contains("成田") || from.contains("narita"))
+                if (from.contains("成田") || from.toLowerCase().contains("narita"))
                     from = "成田";
-                else if (from.contains("羽田") || from.contains("haneda"))
+                else if (from.contains("羽田") || from.toLowerCase().contains("haneda"))
                     from = "羽田";
                 from = from.equals("成田") || from.equals("羽田") ? from : AddressParser.getRegionSmart(from);
+                row.put("__parsed_from", from); // 存入字典供后续分段筛选
+
+                // 预解析终点
                 String to = row.getOrDefault("field_37", "未知终点");
-                if (to.contains("成田") || to.contains("narita"))
+                if (to.contains("成田") || to.toLowerCase().contains("narita"))
                     to = "成田";
-                else if (to.contains("羽田") || to.contains("haneda"))
+                else if (to.contains("羽田") || to.toLowerCase().contains("haneda"))
                     to = "羽田";
                 to = to.equals("成田") || to.equals("羽田") ? to : AddressParser.getRegionSmart(to);
+                row.put("__parsed_to", to); // 存入字典供后续分段筛选
+
                 String carType = row.getOrDefault("field_27", "");
                 if (carType.contains("豪华7"))
                     carType = "豪华7";
@@ -716,6 +796,7 @@ public class JinshujuTTS {
                     carType = "宝贝专车";
                 else
                     carType = "";
+
                 String flightNo = row.getOrDefault("field_24", "未留航班号");
                 String otherService = row.getOrDefault("field_56", "");
                 if (otherService.contains("举牌") && otherService.contains("儿童"))
@@ -728,10 +809,67 @@ public class JinshujuTTS {
                     else
                         otherService = "";
                 }
+
                 flightNo = from.equals("成田") || from.equals("羽田") ? flightNo : "";
-                sb.append(time).append(from).append(to).append(flightNo.equals("") ? "" : flightNo)
-                        .append(otherService.equals("") ? "" : otherService).append(carType.equals("") ? "" : carType)
-                        .append("\r\n");
+
+                // 生成这一行最终的输出字符串，并缓存
+                String formatted = time + from + to + (flightNo.equals("") ? "" : " " + flightNo)
+                        + (otherService.equals("") ? "" : otherService) + (carType.equals("") ? "" : carType) + "\r\n";
+                row.put("__formatted_str", formatted);
+            }
+
+            StringBuilder sb = new StringBuilder();
+
+            // ==========================================
+            // 1. 导出全部接送机订单
+            // ==========================================
+            sb.append("=== 金数据平台暂未分配司机的接送机订单 ===\r\n");
+            for (Map<String, String> row : targetList) {
+                sb.append(row.get("__formatted_str"));
+            }
+
+            // ==========================================
+            // 2. 导出送成田
+            // ==========================================
+            sb.append("\r\n=== 送成田 ===\r\n");
+            for (Map<String, String> row : targetList) {
+                String type = row.getOrDefault("field_19", "");
+                if (type.contains("送机") && "成田".equals(row.get("__parsed_to"))) {
+                    sb.append(row.get("__formatted_str"));
+                }
+            }
+
+            // ==========================================
+            // 3. 导出接成田
+            // ==========================================
+            sb.append("\r\n=== 接成田 ===\r\n");
+            for (Map<String, String> row : targetList) {
+                String type = row.getOrDefault("field_19", "");
+                if (type.contains("接机") && "成田".equals(row.get("__parsed_from"))) {
+                    sb.append(row.get("__formatted_str"));
+                }
+            }
+
+            // ==========================================
+            // 4. 导出送羽田
+            // ==========================================
+            sb.append("\r\n=== 送羽田 ===\r\n");
+            for (Map<String, String> row : targetList) {
+                String type = row.getOrDefault("field_19", "");
+                if (type.contains("送机") && "羽田".equals(row.get("__parsed_to"))) {
+                    sb.append(row.get("__formatted_str"));
+                }
+            }
+
+            // ==========================================
+            // 5. 导出接羽田
+            // ==========================================
+            sb.append("\r\n=== 接羽田 ===\r\n");
+            for (Map<String, String> row : targetList) {
+                String type = row.getOrDefault("field_19", "");
+                if (type.contains("接机") && "羽田".equals(row.get("__parsed_from"))) {
+                    sb.append(row.get("__formatted_str"));
+                }
             }
 
             try {
@@ -746,13 +884,11 @@ public class JinshujuTTS {
                 BannerUI.showBanner("<html>成功导出金数据" + ts + ".txt (共计 <font color='#FF6B6B'><b>" + targetList.size()
                         + "</b></font> 条记录)</html>");
 
-                // 【优化：自动打开文件夹并精准选中文件，防冗余窗口】
                 try {
                     String os = System.getProperty("os.name").toLowerCase();
                     if (os.contains("win")) {
                         String absolutePath = file.toAbsolutePath().toString();
 
-                        // 完整的 PowerShell 脚本
                         String psScript = "$path = '" + absolutePath + "'; " +
                                 "$dir = Split-Path $path; " +
                                 "$shell = New-Object -ComObject Shell.Application; " +
@@ -768,19 +904,16 @@ public class JinshujuTTS {
                                 "        $Win32::SetForegroundWindow($window.HWND); " +
                                 "    } catch {} " +
                                 "} else { " +
-                                "    explorer.exe /select,\"$path\"; " + // <--- 【核心修复】：删除了逗号和路径之间的空格
+                                "    explorer.exe /select,\"$path\"; " +
                                 "}";
 
-                        // 将脚本转换为 UTF-16LE 编码的 Base64 字符串
                         String encodedCommand = java.util.Base64.getEncoder()
                                 .encodeToString(psScript.getBytes(java.nio.charset.StandardCharsets.UTF_16LE));
 
-                        // 执行命令
                         new ProcessBuilder("powershell", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
                                 "-EncodedCommand", encodedCommand).start();
 
                     } else if (Desktop.isDesktopSupported()) {
-                        // Mac/Linux系统：兜底方案
                         Desktop.getDesktop().open(dir.toFile());
                     }
                 } catch (Exception ex) {
